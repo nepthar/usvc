@@ -1,0 +1,1009 @@
+#!/bin/bash
+# Run/Manage processes as user background jobs
+# (C) 2011 Jordan Parker - jordan@omniar.com
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# I Strongly suggest you enable code folding around '#+' and '#-'
+
+# Info                           #+
+# Sample workflow:
+# $ usvc init (this may already have been done)
+#   - Sets up usvc environment with a tmux session
+# $ usvc start -n 4 -g worker /path/to/worker/binary args
+#   - Starts 4 copies of "binary" in group "worker" under usvc contorl
+# Here's the chain of events that happens internally:
+# 1) usvc start calls the internal start process function which
+#	a) Sets up the configuration files for the process
+#	b) Creates a new window in the usvc tmux session and runs "usvc _r_run config_file"
+# 2) usvc _r_run calls the internal usvc_run_keepalive function which
+#	a) Writes all relevant config data to the config file
+#	b) Starts the binary in an infinite loop.
+
+#-
+
+# Set up property calls          #+
+
+which git > /dev/null || { echo "Can't find git. We require git for property reading/writing"; exit 1; }
+
+prop.get()
+{
+	local pfile="$1"
+	local key="$2"
+
+	[[ -f "$pfile" ]] || { echo "No such file: [$pfile]" >&2; return 1; }
+	
+	#[11/23/2013] Get with default
+	if (( $# > 2 )); then
+		shift 2
+		git config --file "$pfile" --get "$key" || echo $@
+		return 0
+	fi
+	
+	git config --file "$pfile" --get "$key"	
+}
+
+prop.get_bool()
+{
+	#[11/23/2013] This is clearly never used.
+	local pfile="$1"
+	local key="$2"
+	local default="${3-0}"
+}
+
+prop.set()
+{
+	local pfile="$1"
+	local key="$2"
+	shift 2
+	local value="$@"
+	[[ -f "$pfile" ]] || { echo "No such file: [$pfile]" >&2; return 1; }
+
+	git config --file "$pfile" "$key" "$value"
+}
+
+prop.list_groups()
+{
+	local pfile="$1"
+	local filter="$2"
+	[[ -f "$pfile" ]] || { echo "No such file: [$pfile]" >&2; return 1; }
+	
+	if [[ -z "$filter" ]]; then
+		git config --file "$pfile" --list  | cut -d'=' -f1 | sed 's/\(.*\)\..*/\1/' | sort -u
+	else
+		if [[ "$filter" == *"." ]]; then
+			local f2="${filter//./\.}"
+			git config --file "$pfile" --list  | cut -d'=' -f1 | grep "$filter" | sed -e 's/\(.*\)\..*/\1/' -e 's/'$f2'//g' | sort -u
+		else
+			git config --file "$pfile" --list  | cut -d'=' -f1 | grep "$filter" | sed 's/\(.*\)\..*/\1/' | sort -u
+		fi
+		
+	fi
+}
+
+prop.list_keys()
+{
+	local pfile="$1"
+	local filter="$2"
+	[[ -f "$pfile" ]] || { echo "No such file: [$pfile]" >&2; return 1; }
+	
+	if [[ -z "$filter" ]]; then
+		git config --file "$pfile" --list  | cut -d'=' -f1
+	else
+		if [[ "$filter" == *"." ]]; then
+			local f2="${filter//./\.}"
+			git config --file "$pfile" --list  | cut -d'=' -f1 | grep "$filter" | sort -u | sed 's/'$f2'//g'
+		else
+			git config --file "$pfile" --list  | cut -d'=' -f1 | grep "$filter" | sort -u
+		fi
+	fi
+}
+
+#-
+
+if ((EUID == 0)); then
+	echo "You need to really know what you're doing to run this as root"
+	exit 1
+fi
+
+#[11/23/2013] Note the difference of style here and the block above
+if [[ $# -eq 0 ]]; then
+	echo "usvc (options) [command]"
+	echo "commands: start, stop, restart, clean, jobs, status, log, logchunk, attach, pidof, conf, load, save, init"
+	echo "man usvc for help" #[11/23/2013] The manpage has been lost forever :(
+	exit 0;
+fi
+
+# Usage, Help, Setup             #+
+
+usvc_dir="/var/run/usvc"
+usvc_procs="/var/run/usvc"
+usvc_io="/var/log/usvc"
+usvc_tmx_session="usvc"
+usvc_tmx_cmd="/usr/bin/tmux -q -L usvc_socket"
+usvc_path="/usr/local/bin/usvc"
+usvc_sleep_time=300
+usvc_cache='/mnt/caches/'
+
+usvc_exit=0
+
+#-
+
+# Conf File/Proc mgmt functions  #+
+
+#[11/23/2013] Gathers all of the configuration files either by name or by keyword.
+conf_files ()
+{
+	local file_list=""
+	local all_confs="$(find "$usvc_procs" -name "*.conf")"
+	for arg in $@; do
+		if [[ -f "${usvc_procs}/${arg}.conf" ]]; then
+			file_list="${file_list}${usvc_procs}/${arg}.conf\n"
+			
+		elif [[ "${arg}" == "all" ]]; then
+			file_list="${all_confs//$'\n'/\n}"
+			break
+			
+		elif [[ "${arg}" == "live" ]]; then
+			for conf_file in $all_confs; do
+				if is_running $conf_file; then
+					file_list="${file_list}$conf_file\n"
+				fi
+			done
+			
+		elif [[ "${arg}" == "dead" ]]; then
+			for conf_file in $all_confs; do
+				if ! is_running $conf_file; then
+					file_list="${file_list}$conf_file\n"
+				fi
+			done
+			
+		else
+			for conf_file in $all_confs; do
+				if [[ "$(prop.get "$conf_file" "core.group")" == "$arg" ]]; then
+					file_list="${file_list}$conf_file\n"
+				fi
+			done
+			
+		fi
+	done
+	
+	if [[ -z $file_list ]]; then
+		# Don't bother continuing because whatever is calling this probably needs a list of conf files.
+		exit 1
+	else
+		echo -en ${file_list} | sort -u
+	fi
+}
+
+pid_from_conf()
+{
+	local -a line=($(ps --no-header --ppid="$(prop.get "$1" "core.ctrl-pid")" --sort=start -o "%p" 2>/dev/null))
+	echo "${line[0]}"
+}
+
+gen_uid()
+{
+	# My attempt to uniquely identify a process. PID is not good enough as they are re-assigned.
+	# Also note that this examines the control PID rather than the worker's PID
+	local pstat_file="/proc/$(prop.get "$1" "core.ctrl-pid")/stat"
+	local -a proc_info
+	
+	if [[ -r "$pstat_file" ]]; then
+		read -a proc_info < "$pstat_file"
+		echo "${proc_info[1]}${proc_info[0]}-${proc_info[3]}-${proc_info[21]}"
+	else
+		echo "-NONE-"
+	fi
+}
+
+is_running()
+{
+	[[ "$(gen_uid "$1")" == "$(prop.get "$1" "core.uid")" ]]
+}
+
+# list_groups()
+# {
+# 	(
+# 		for conf_fie in $(conf_files all):
+# 			prop.get $conf_file 
+# 	)
+# }
+#-
+
+# Process Runner Functions       #+
+
+ulog()
+{
+	date +"%b %d %H:%M:%S [usvc] $@"
+}
+
+usvc_run_service()
+{
+	export conf_file="$1"
+	
+	sleep 1
+	
+	# Export all of this shit to children processes
+	export cmd="$(prop.get $conf_file core.cmd)"
+	export args="$(prop.get $conf_file core.args "")"
+	export name="$(prop.get $conf_file core.name)"
+	export group="$(prop.get $conf_file core.group)"
+	export usvc_wd="$(prop.get $conf_file core.cwd)"
+	export log_file="$(prop.get $conf_file core.log)"
+	export tmux_handle="$(prop.get $conf_file core.tmux-handle)"
+	
+	export run_length=0
+	export deaths=0
+	export exit_status=0
+	export hn="$(hostname)"
+
+	_process_args()
+	{
+		local ret=""
+		for arg in $@; do
+			case $arg in
+				"~EXIT_STATUS")
+					ret="$ret $exit_status"
+					;;
+				'~JOB_NAME')
+					ret="$ret $name"
+					;;
+				'~HOSTNAME')
+					ret="$ret $hn" 
+					;;
+				'~RUN_LENGTH')
+					ret="$ret $run_length"
+					;;
+				'~DEATHS')
+					ret="$ret $deaths"
+					;;
+				*)
+					ret="$ret $arg"
+					;;
+			esac
+		done
+		echo -n $ret
+	}
+
+	prop.set "$conf_file" "core.ctrl-pid" "$$" # ARG!!! Can't have underscores in key names?!?!? wtf git!
+	prop.set "$conf_file" "core.uid" "$(gen_uid $conf_file)" #gen_uid looks for ctrl-pid in the conf file. It must be there.
+
+	export deaths=0
+		
+	if [[ ! -x $cmd ]]; then
+		ulog "Fatal: Command not executable: [$cmd]"
+		exit 1
+	fi
+	
+	if [[ -z $name ]] || [[ -z $group ]]; then
+		ulog "Please specify both name and group. Got [$name] [$group]"
+		exit 1
+	fi
+	
+	ulog " ---- [ Initilizing $name ] ----"
+	
+	while :
+	do
+		# It's possible the binary changed folders. Switch back to the working dir.
+		cd "$usvc_wd"
+		
+		# Attach tmux session to log file. This closes any previous pane pipes.
+		$usvc_tmx_cmd pipe-pane -t "${tmux_handle}" "cat >> ${log_file}"
+		
+		last_start="$(date +"%s")"
+		prop.set "$conf_file" "core.status" "starting"
+		prop.set "$conf_file" "core.deaths" "$deaths"
+		prop.set "$conf_file" "core.last-start" "$last_start"
+		
+		# See if we need to do any pre-run
+		pre_run_cmd="$(prop.get "$conf_file" "core.pre-cmd")"
+		if [[ -x "$pre_run_cmd" ]]; then
+			prop.set "$conf_file" "core.status" "pre-run"
+			pre_run_args="$(_process_args $(prop.get $conf_file core.pre-args " "))"
+			ulog "Starting pre-run [$pre_run_cmd $pre_run_args]"
+			$pre_run_cmd  $pre_run_args 2>&1
+			ulog "Finished pre-run"
+		fi
+		
+		# Recalculate MD5 of the binary
+		prop.set "$conf_file" "core.md5" "$(md5sum $cmd 2>/dev/null | cut -c1-9)"
+		
+		args="$(_process_args $(prop.get $conf_file core.args " "))"
+		
+		# Start the program
+		ulog "Starting service [$cmd $args]"
+
+		prop.set "$conf_file" "core.status" "running"
+		$cmd $args
+		exit_status="$?"
+		prop.set "$conf_file" "core.status" "dead"
+		
+		run_length="$(date +"%s")"
+		run_length=$((run_length - last_start))
+		
+		if [[ $exit_status -ne 0 ]]; then
+			deaths=$((deaths + 1))
+		fi
+		
+		prop.set "$conf_file" "core.deaths" "$deaths"
+		
+		ulog "Service terminated after running for ${run_length}s"
+		
+		# Send alert, if someone is specified
+		alert="$(prop.get "$conf_file" "core.alert")"
+		
+		if [[ ! -z $alert ]] && [[ $exit_status -ne 0 ]]; then
+			for person in $alert; do
+				notify -w"$person" -a"usvc" "${name} has died" "\nLog dump:\n$(tail -n 50 $log_file)"
+			done
+		fi
+		
+		post_run_cmd="$(prop.get "$conf_file" "core.post-cmd" " ")"
+		if [[ ! -z $post_run_cmd ]]; then
+			prop.set "$conf_file" "core.status" "post-run"
+			post_run_args="$(_process_args $(prop.get $conf_file core.post-args " "))"
+			ulog "Starting post-run [$post_run_cmd $post_run_args]"
+			$post_run_cmd $post_run_args 2>&1
+			ulog "Finished post run"
+		fi
+		
+		if [[ $run_length -le 60 ]] && "$(prop.get $conf_file core.runaway-protect "true")"; then
+			ulog "$cmd has terminated after ${run_length}s. Sleeping for $usvc_sleep_time..."
+			prop.set "$conf_file" "core.status" "waiting"
+			sleep $usvc_sleep_time
+			ulog "Sleep complete"
+		fi
+		
+		keepalive="$(prop.get $conf_file core.keepalive 'true')"
+		
+		if [[ "$keepalive" == "false" ]]; then
+			prop.set "$conf_file" "core.status" "stopped"
+			ulog "$name is terminating. Keepalive is false."
+			exit 0
+		fi
+		
+		echo
+		sleep 1
+		
+	done
+}
+
+# On tmux screen 1 with USVC
+usvc_statmode ()
+{
+	
+	notes()
+	{	
+		cat <<-EOF
+		Available commands:
+		    status         ~ Displays status of running processes
+		    stop [jobs]    ~ Sends sigterm, waits, then sigkill for jobs specified
+		    restart [jobs] ~ Restarts a job, calling stop first.
+		    clean [jobs]   ~ Removes knowledge of jobs. Once cleaned, they can't be restarted
+		    jobs [jobs]    ~ Dumps the names of jobs selected by [jobs]
+		    notes          ~ This notes message
+		    clear          ~ Clears the console
+		
+		Jobs:
+		    When specifying [jobs], you can specify a list of jobs by name (groupA-1 groupA-2) or by group (groupA) or by these keywords (all live dead)
+		    Ex: 'restart dead' will restart only jobs which are dead. Use the jobs command to see which jobs you're actually selecting
+		
+		Shortcut Keys:
+		    Ctrl + b : Tmux Prefix        Ctrl + d : Detatch from usvc
+		    Ctrl + l : list job windows   Ctrl + s : enter scroll mode
+		
+		Scroll Mode:
+		    - 'q' Quits scroll mode
+		    - arrow keys navigate
+		    - alt + arrow keys navigate quickly
+		    - The scroll buffer is not infinite. Use logs.
+		
+		Other Notes:
+		    USVC is just a wrapper on tmux. If you do things like create new windows, close windows, rename windows, etc. you're gonna have a bad time.
+		EOF
+	}
+	echo "help for help!"
+	while :
+	do
+		read -a ucmd -p "usvc> "
+		if [[ ! -z $ucmd ]]; then
+			case ${ucmd[0]} in
+				help|notes)
+					clear
+					notes
+					;;
+				clear)
+					clear
+					;;
+				stop|restart|clean|status|jobs)
+					usvc ${ucmd[@]}
+					;;
+				*)
+					echo "bad command"
+					;;
+			esac
+			echo
+		fi
+	done
+}
+
+#-
+
+# Service Control                #+
+make_svc_name()
+{
+	local counter=1
+	local group="$1"
+	local name="${group}-${counter}"
+	
+	# Count up, starting from one!
+	while [[ -f "${usvc_procs}/${name}.conf" ]]; do
+		counter=$((counter+1))
+		name="${group}-${counter}"
+	done
+	
+	echo "$name"
+}
+
+stop_process ()
+{
+
+	for conf_file in $@; do
+		if is_running "$conf_file"; then
+			echo "Stopping $(prop.get "$conf_file" "core.name")"
+			kill "$(prop.get $conf_file "core.ctrl-pid")"
+		else
+			echo "$(prop.get $conf_file "core.name") is already dead."
+		fi
+	done
+	
+	sleep 1
+	
+	# Second check to see if any procs failed to shut down.
+	for conf_file in $@; do
+		if is_running "$conf_file"; then
+			echo "warning ~ Force-killing $(prop.get "$conf_file" "core.name")"
+			kill -9 "$(prop.get $conf_file "core.ctrl-pid")"
+		fi
+		
+		prop.set "$conf_file" "core.status" "stopped"
+	done
+	
+}
+
+start_process () 
+{
+
+	if [[ $# -eq 0 ]]; then
+		echo "usvc start (-a user|-n #|-o|-g group) [command] (args)"
+		exit 1
+	fi
+	
+	# Create new session if necessary, avoid tmux redirect bug
+	$usvc_tmx_cmd has-session -t "$usvc_tmx_session" 2>&1 | cat /dev/null
+	if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+		echo "error ~ Run usvc init first"
+		exit 1
+	fi
+	
+	local svc_keepalive="true"
+	local svc_group="none"
+	local svc_num="1"
+	local svc_alert=""
+	
+	
+	while getopts "og:n:a:" option; do
+		case $option in
+			a)
+				svc_alert="$OPTARG"
+				;;
+			n)
+				svc_num="$OPTARG"
+				;;
+			1)
+				svc_keepalive="false"
+				;;
+			g)
+				svc_group="$OPTARG"
+				;;
+			:)
+				echo "$OPTARG requires an argument"
+				exit 1
+				;;
+			*)
+				echo "Unrecognized option: $OPTARG"
+				exit 1
+				;;
+		esac
+	done
+	shift $(( OPTIND - 1 ))
+	# The next line is extremely important.
+	OPTIND=1
+	
+	#[11/23/2013] ^^ A link to documentation would have been helpful.
+	
+	if [[ -x "$1" ]]; then
+		svc_cmd="$(readlink -f ${1})"
+	else
+		svc_cmd="$(which ${1})"
+	fi
+	
+	if [[ ! -x "$svc_cmd" ]]; then
+		echo "error ~ can't find or execute: $1"
+		exit 1
+	fi
+	
+	case $svc_group in
+		usvc|group|all|live|dead)
+			echo "error ~ reserved group name: $svc_group"
+			exit 1
+			;;
+		*_*)
+			echo "Sorry bro, no undescores in group names. Dashes are cool, though"
+			exit 1
+			;;
+	esac
+
+	shift 1
+	
+	local OLD_TMUX="$TMUX"
+	local run_line
+	local uid
+	
+	# I know what I'm doing.
+	unset TMUX
+	#[11/23/2013] Again, wish I linked to some docs...
+	
+	counter=1
+	while [[ $counter -le $svc_num ]]; do
+		
+		echo "Starting $svc_group $counter of $svc_num..."
+		svc_name="$(make_svc_name $svc_group)"
+		#log.d "Service name: $svc_name"
+		conf_file="${usvc_procs}/${svc_name}.conf"
+		touch $conf_file
+		
+		if [[ ! -z $svc_alert ]]; then
+			prop.set "$conf_file" "core.alert" "$svc_alert"
+		fi
+		
+		# Generate the command that we're sending to tmux.  In this case:
+		# [USVC script path] [run mode] [service name] [service group] [command] [args]
+		# where [run mode] is either "_r_keepalive" or "_r_once". This triggers USVC to run processes rather than manage them.
+		
+		log_file="${usvc_io}/${svc_name}.log"
+		svc_cwd="${usvc_procs}/${svc_name}"
+		mkdir -p "${svc_cwd}"
+
+		# Link in caches
+		ln -s "${usvc_cache}" "${svc_cwd}/caches"
+		
+		prop.set "$conf_file" "core.cwd" "$svc_cwd"
+		prop.set "$conf_file" "core.log" "$log_file"
+		prop.set "$conf_file" "core.keepalive" "$svc_keepalive"
+		prop.set "$conf_file" "core.name" "$svc_name"
+		prop.set "$conf_file" "core.group" "$svc_group"
+		prop.set "$conf_file" "core.cmd" "$svc_cmd"
+		prop.set "$conf_file" "core.md5" "$(md5sum $svc_cmd 2>/dev/null | cut -c1-32)"
+		prop.set "$conf_file" "core.args" "$@"
+		prop.set "$conf_file" "core.tmux-handle" "${usvc_tmx_session}:${svc_name}"
+		
+		run_line="$usvc_path _r_run $conf_file"
+		$usvc_tmx_cmd new-window -n "$svc_name" -t "$usvc_tmx_session" "$run_line"
+		$usvc_tmx_cmd set-window-option -t "${usvc_tmx_session}:${svc_name}" automatic-rename off
+		$usvc_tmx_cmd set-window-option -t "${usvc_tmx_session}:${svc_name}" remain-on-exit on
+		
+		TMUX="$OLD_TMUX"
+		
+		counter=$((counter+1))
+		sleep 0.65
+		
+		if [[ $(prop.get $conf_file "core.deaths") -gt 0 ]]; then
+			echo "error ~ job crashed instantly"
+			exit 1
+		fi
+
+	done
+	
+	TMUX="$OLD_TMUX"
+}
+
+restart_process ()
+{
+
+	local conf_file
+	local tmux_window
+	local name
+	
+	for conf_file in $@; do
+		name="$(prop.get $conf_file "core.name")"
+		log_file="$(prop.get $conf_file "core.log")"
+		tmux_window="${usvc_tmx_session}:${name}"
+		echo "restarting $name..."
+		log_file="$(prop.get $conf_file "core.log")"
+		cmd_file="$(prop.get $conf_file core.cmd)"
+		printf "\n### Manual Restart\n" >> $log_file
+		$usvc_tmx_cmd respawn-window -k -t "$tmux_window"
+		$usvc_tmx_cmd pipe-pane -t "$tmux_window" "cat >> ${log_file}"
+		sleep 0.5
+	done
+}
+
+#-
+
+# Service Status/info/properties #+
+get_status ()
+{
+	# Write out system status line
+	read -a loadavg < /proc/loadavg
+	
+	mem_array=($(cat /proc/meminfo))
+
+	mem_total_kb="${mem_array[1]}"
+	mem_free_kb="${mem_array[4]}"
+	mem_cached_kb="${mem_array[10]}"
+	mem_buffers_kb="${mem_array[7]}"
+	swap_cached_kb="${mem_array[13]}"
+	swap_total_kb="${mem_array[40]}"
+	swap_free_kb="${mem_array[43]}"
+
+	# We display how much of each item is used, not how much is free.
+	if [[ ${swap_total_kb} -eq 0 ]]; then
+		swap_percent="no swap"
+	else
+		swap_percent="$(echo "(100.0 / ${swap_total_kb}.0) * (${swap_total_kb}.0 - ${swap_free_kb}.0 - ${swap_cached_kb}.0)" | bc -l)"
+		swap_percent="$(printf 'swap %4.1f%%' $swap_percent)"
+	fi
+	
+	mem_percent="$(echo "(100.0 / ${mem_total_kb}.0) * (${mem_total_kb}.0 - ${mem_free_kb}.0 - ${mem_cached_kb}.0 - ${mem_buffers_kb})" | bc -l)"
+	local ncpus=$(grep 'model name' /proc/cpuinfo | wc -l)
+	
+	# Pipes use subshells. Can't build a string like usual
+	hd_statline ()
+	{
+		df -h | while read -a line; do
+			case ${line[0]} in
+				"/dev/sda1")
+					printf "$sl [root %4.1f%%]" "${line[4]%'%'}"
+					;;
+				
+				"/dev/sdb")
+					printf " [cache %4.1f%%]" "${line[4]%'%'}"
+					;;
+				
+				"/dev/sd"*) # <3 bash
+					printf " [%s %4.1f%%]" "${line[5]##*/}" "${line[4]%'%'}"
+					;;
+				*)
+					;;
+			esac
+		done
+		echo
+	}
+	printf "\"$(uname -n)\" [%d cores] [load %.2f %.2f %.2f %s] [mem %4.1f%%] [%s] [fds %d]" "$ncpus" "${loadavg[0]}" "${loadavg[1]}" "${loadavg[2]}" "${loadavg[3]}" "$mem_percent" "$swap_percent" "$(lsof -b 2>/dev/null | wc -l)"
+	hd_statline
+	
+	# Print out statline only if called with -s or not yet init'd
+	$usvc_tmx_cmd has-session -t "$usvc_tmx_session" 2>&1 | cat /dev/null
+	if [[ ${PIPESTATUS[0]} -ne 0 ]] || [[ "$1" == "-s" ]]; then
+		return 0
+	fi
+
+	#       NAME  PID  GRP   PSTAT MEM   Deaths  CMD 
+	pf_fmt="%-16s %-7s %-12s %-10s %-7s %-4s %-9s %s\n"	
+	printf "$pf_fmt" "service name" "pid" "group" "status" "mem" "D" "md5" "cmd"
+	
+	local pagesz_mb="$(getconf PAGESIZE) / 1048576"
+	
+	for conf_file in $(conf_files all) ; do
+		
+		usvc_cmd=$(basename $(prop.get $conf_file "core.cmd") )
+		job_id="$(pid_from_conf $conf_file)"
+		usvc_pstat="$(prop.get "$conf_file" "core.status")"
+		
+		if is_running "$conf_file" && [[ "$usvc_pstat" == "running" ]] ; then
+			read -a proc_stat < "/proc/${job_id}/stat"
+			
+			case ${proc_stat[2]} in
+				S) usvc_pstat="asleep"  ;;
+				R) usvc_pstat="running" ;;
+				D) usvc_pstat="asleep*" ;; # Asleep and uninterruptable
+				Z) usvc_pstat="zombie"  ;;
+				T) usvc_pstat="traced"  ;;
+				W) usvc_pstat="paging"  ;;
+				*) usvc_pstat="?? ${proc_stat[2]}" ;;
+			esac
+			
+			printf -v usvc_mem "%.0fM" "$(echo "${proc_stat[23]} * $pagesz_mb" | bc -l)"
+		else
+			job_id="-"
+			usvc_mem="-"
+			#usvc_pstat="dead"
+		fi
+		
+		printf "$pf_fmt" \
+			"$(prop.get $conf_file "core.name")" \
+			"$job_id" \
+			"$(prop.get $conf_file "core.group")" \
+			"$usvc_pstat" \
+			"${usvc_mem}" \
+			"$(prop.get $conf_file "core.deaths")" \
+			"$(prop.get $conf_file "core.md5")" \
+			"$usvc_cmd $(prop.get $conf_file "core.args")"
+		
+	done	
+}
+
+get_log_chunk ()
+{
+	local found=0
+	uid="$1"
+	if [[ -z "$uid" ]]; then
+		echo "usage: logchunk [uid]"
+		return 1
+	fi
+
+	local logs="$(find ${usvc_io} -name "*.log")"
+
+	sed -n "/${uid}/,/${uid}/p" $logs
+}
+
+#-
+
+# Mantinance Functions           #+
+
+clean ()
+{
+	local window_name
+	local conf_file
+	local name
+	local good_log_files
+
+	date_format='%b_%d_%H_%M_%S'
+	
+	for conf_file in $@; do
+		
+		name="$(prop.get $conf_file "core.name")"
+		echo -n "$name "
+
+		if is_running "$conf_file"; then
+			echo "-> skipped (running)"
+			good_log_files="$good_log_files $(prop.get $conf_file "core.log")"
+		else
+			window_name="${usvc_tmx_session}:${name}"
+			log_file="$(prop.get $conf_file "core.log")"
+			time_started="$(prop.get $conf_file core.last-start)"
+			# Workaround tmux redirection bug
+			$usvc_tmx_cmd kill-window -t "$window_name" 2>&1 | cat > /dev/null
+			/bin/rm -f "$conf_file"
+			/bin/rm -Rf "${conf_file%%.conf}"
+
+			new_log_name="${name}-$(date -d@${time_started} +${date_format}).log"
+			mv "$log_file" "${usvc_io}/old/${new_log_name}"
+
+			echo "-> cleaned"
+		fi
+	
+	done
+
+	mkdir -p "${usvc_io}/old"
+
+	local save
+
+	for lfile in $(find ${usvc_io} -maxdepth 1 -name '*.log'); do
+		save=0
+		for keep_file in $good_log_files; do
+			if [[ "$lfile" == "$keep_file" ]]; then
+				save=1
+				break
+			fi
+		done
+
+		if [[ $save -eq 0 ]]; then
+			mv "$lfile" "${usvc_io}/old"
+		fi
+			
+	done
+	
+}
+
+init ()
+{
+	# Workaround tmux redirection bug
+	$usvc_tmx_cmd has-session -t "$usvc_tmx_session" 2>&1 | cat > /dev/null
+	if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+
+		# Remove old conf files.
+		echo "Cleaning old files (if any).."
+		clean $(conf_files all)
+		
+		echo "Initializing..."
+		
+		$usvc_tmx_cmd new-session -d -n "status" -s "$usvc_tmx_session" "usvc _r_statmode"
+		$usvc_tmx_cmd set-window-option -t "${usvc_tmx_session}:0" remain-on-exit on
+		# $usvc_tmx_cmd unbind C-b
+		# $usvc_tmx_cmd set -g prefix C-v
+		$usvc_tmx_cmd bind-key -n C-d detach
+		$usvc_tmx_cmd bind-key -n C-l choose-window
+		$usvc_tmx_cmd bind-key -n C-s copy-mode
+		$usvc_tmx_cmd bind-key -n C-c display-message " ## Use usvc stop to terminate this process ##"
+		$usvc_tmx_cmd set-option -g set-titles off
+		$usvc_tmx_cmd set-option -g status-right "[ C-D to detatch  ]"
+		$usvc_tmx_cmd set-option -g status-left "%m-%d %H:%M:%S %s |"
+		$usvc_tmx_cmd set-option -g status-left-length 29
+		echo 'Done.'
+	else
+		echo "already ran init"
+	fi
+}
+
+#-
+
+# Load/Save                      #+
+save()
+{
+	local output="$1"
+	local last_group
+	local group
+	echo "Saving state to $output..."
+	
+	echo > "$output"
+	
+	local ctr=1
+	
+	for conf_file in $(conf_files all); do
+		
+		group="$(basename $conf_file ".conf")"
+		group="${group%-*}"
+		
+		if [[ "$group" != "$last_group" ]]; then
+			local key="group-${ctr}"
+			prop.set "$output" "${key}.num-procs" "$(echo ${usvc_procs}/${group}-*.conf | wc -w )"
+			prop.set "$output" "${key}.cmd" "$(prop.get "$conf_file" "core.cmd")"
+			prop.set "$output" "${key}.args" "$(prop.get "$conf_file" "core.args")"
+			prop.set "$output" "${key}.keepalive" "$(prop.get "$conf_file" "core.keepalive")"
+			prop.set "$output" "${key}.alert" "$(prop.get "$conf_file" "core.alert")"
+			prop.set "$output" "${key}.group-name" "$group"
+			((ctr++))
+		fi
+		
+		last_group="$group"
+	done	
+}
+
+load()
+{
+	local cfile="$1"
+	local cmd
+	local alert
+	local args
+	local keepalive
+	local num
+	
+	for key in $(prop.list_groups "$cfile"); do
+		cmd="$(prop.get "$cfile" "${key}.cmd")"
+		args="$(prop.get "$cfile" "${key}.args")"
+		alert="$(prop.get "$cfile" "${key}.alert")"
+		keepalive="$(prop.get "$cfile" "${key}.keepalive")"
+		num="$(prop.get "$cfile" "${key}.num-procs")"
+		group="$(prop.get "$cfile" ${key}.group-name "none")"
+		
+		if [[ "$keepalive" == "true" ]]; then
+			keepalive=""
+		else
+			keepalive="-1"
+		fi
+		
+		if [[ ! -z "$alert" ]]; then
+			alert="-a $alert"
+		fi
+		
+		start_process -n "$num" -g "$group" $keepalive $alert "$cmd" "$args"
+	done
+}
+
+#-
+
+# Top Level Parse                #+
+in_cmd="$1"
+shift 1
+
+case $in_cmd in
+	
+	start)
+		start_process $@
+		;;
+		
+	stop)
+		stop_process $(conf_files $@)
+		;;
+	
+	restart)
+		restart_process $(conf_files $@)
+		;;
+		
+	status)
+		get_status $@
+		;;
+	
+	clean)
+		clean $(conf_files $@)
+		;;
+	
+	log)
+		for conf in $(conf_files $@); do
+			prop.get "$conf" "core.log"
+		done
+		;;
+
+	logchunk)
+		get_log_chunk $@
+		;;
+		
+	pidof)
+		for conf in $(conf_files $@); do
+			pid_from_conf $conf
+		done
+		;;
+	
+	jobs)
+		for conf in $(conf_files $@); do
+			prop.get $conf core.name
+		done
+		;;
+
+	attach)
+		if [[ -z $TMUX ]]; then
+			$usvc_tmx_cmd attach
+		else
+			echo "Sorry, attaching to usvc in a tmux session causes issues that are not a priorty to resolve."
+		fi
+		;;
+	
+	load)
+		load $@
+		;;
+	
+	save)
+		save $@
+		;;
+		
+	conf)
+		conf_files $@
+		;;
+	
+	init)
+		init
+		;;
+		
+	vars)
+		# Dome some environment variables
+		echo "Variables:"
+		set | grep '^usvc_.*\=.*$' | tr '=' '\t' | column -t -s$'\t'
+		;;
+		
+	_r_run)
+		usvc_run_service $@
+		;;
+		
+	_r_statmode)
+		usvc_statmode
+		;;
+		
+	_cmd)
+		$@
+		exit $?
+		;;
+	
+	help)
+		echo "try man usvc" 
+		;;
+		
+	*)
+		echo "Unknown command: \"$in_cmd\" Try usvc help."
+		usvc_exit=1
+		;;
+esac
+
+#-
+
+exit $usvc_exit
